@@ -49,10 +49,22 @@ function createSyncStateTable(): void {
             last_modified_crm   DATETIME      NOT NULL,
             last_modified_graph DATETIME      NOT NULL,
             last_synced_at      DATETIME      NOT NULL,
+            content_hash        VARCHAR(64)   NULL DEFAULT NULL,
             UNIQUE KEY uq_meeting (meeting_id),
             UNIQUE KEY uq_graph   (graph_event_id(255), graph_mailbox)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
+
+    // Idempotent: add content_hash if table existed before this column was introduced
+    $col = db()->query("
+        SELECT COUNT(*) FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'graph_sync_state'
+          AND COLUMN_NAME  = 'content_hash'
+    ")->fetchColumn();
+    if (!$col) {
+        db()->exec("ALTER TABLE graph_sync_state ADD COLUMN content_hash VARCHAR(64) NULL DEFAULT NULL");
+    }
 }
 
 // ============================================================
@@ -249,13 +261,30 @@ function getSyncStateByGraphId(string $graphEventId, string $mailbox): ?array {
     return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
 }
 
+/**
+ * Look up a sync state row by content hash.
+ * This is the primary duplicate-prevention mechanism: O365 assigns a different
+ * graph_event_id per attendee calendar for the same real-world meeting, so we
+ * cannot rely on graph_event_id alone. The content hash (name + times +
+ * organizer + body) is identical across all copies of the same meeting.
+ */
+function getSyncStateByContentHash(string $contentHash): ?array {
+    $stmt = db()->prepare("
+        SELECT * FROM graph_sync_state
+        WHERE content_hash = ? LIMIT 1
+    ");
+    $stmt->execute([$contentHash]);
+    return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+}
+
 function upsertSyncState(
     string $meetingId,
     string $graphEventId,
     string $mailbox,
     string $hash,
     string $modifiedCrm,
-    string $modifiedGraph
+    string $modifiedGraph,
+    string $contentHash = ''
 ): void {
     $existing = getSyncState($meetingId);
     if ($existing) {
@@ -266,18 +295,20 @@ function upsertSyncState(
                 last_sync_hash      = ?,
                 last_modified_crm   = ?,
                 last_modified_graph = ?,
+                content_hash        = ?,
                 last_synced_at      = NOW()
             WHERE meeting_id = ?
-        ")->execute([$graphEventId, $mailbox, $hash, $modifiedCrm, $modifiedGraph, $meetingId]);
+        ")->execute([$graphEventId, $mailbox, $hash, $modifiedCrm, $modifiedGraph, $contentHash ?: null, $meetingId]);
     } else {
         db()->prepare("
             INSERT INTO graph_sync_state
                 (id, meeting_id, graph_event_id, graph_mailbox,
-                 last_sync_hash, last_modified_crm, last_modified_graph, last_synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+                 last_sync_hash, last_modified_crm, last_modified_graph,
+                 content_hash, last_synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
         ")->execute([
             generateUuid(), $meetingId, $graphEventId, $mailbox,
-            $hash, $modifiedCrm, $modifiedGraph,
+            $hash, $modifiedCrm, $modifiedGraph, $contentHash ?: null,
         ]);
     }
 }
@@ -299,6 +330,52 @@ function computeHash(
     $emails = array_map('strtolower', $attendeeEmails);
     sort($emails);
     return hash('sha256', implode('|', [$name, $dateStart, $dateEnd, $location, implode(',', $emails)]));
+}
+
+// ============================================================
+// Content hash (duplicate prevention)
+// MUST stay identical to the same functions in dedup_meetings.php
+// ============================================================
+
+/**
+ * Normalise a description body for content hashing.
+ * Strips sync metadata, HTML, collapses whitespace, lowercases.
+ */
+function normaliseBody(string $text): string {
+    $text = preg_replace('/^Synced from O365\s*$/m',         '', $text);
+    $text = preg_replace('/^Synced from SuiteCRM\s*$/m',     '', $text);
+    $text = preg_replace('/^\[GRAPH-ID:[^\]]+\]\s*$/m',   '', $text); // legacy
+    $text = preg_replace('/^Organizer:.*$/m',                  '', $text);
+    $text = preg_replace('/^Teams join URL:.*$/m',             '', $text);
+    $text = html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $lines = array_filter(
+        array_map('trim', preg_split('/\r?\n/', $text)),
+        fn($l) => $l !== ''
+    );
+    return strtolower(implode(' ', $lines));
+}
+
+/** Extract organizer email from "Organizer: Name <email>" line. */
+function extractOrganizerEmail(string $description): string {
+    if (preg_match('/^Organizer:.*<([^>]+)>/m', $description, $m)) {
+        return strtolower(trim($m[1]));
+    }
+    return '';
+}
+
+/**
+ * Compute content hash for a meeting.
+ * Covers: name, date_start (min), date_end (min), organizer email, normalised body.
+ * Used to detect duplicate meetings created from different mailboxes.
+ */
+function computeContentHash(array $meeting): string {
+    $desc      = $meeting['description'] ?? '';
+    $name      = strtolower(trim($meeting['name'] ?? ''));
+    $start     = substr($meeting['date_start'] ?? '', 0, 16);
+    $end       = substr($meeting['date_end']   ?? '', 0, 16);
+    $organizer = extractOrganizerEmail($desc);
+    $body      = normaliseBody($desc);
+    return hash('sha256', implode('|', [$name, $start, $end, $organizer, $body]));
 }
 
 // ============================================================
@@ -468,12 +545,14 @@ function parseDateTimeUtc(string $dt): DateTime {
     return new DateTime(rtrim($dt, 'Z') . 'Z', new DateTimeZone('UTC'));
 }
 
-function buildCrmDescription(array $event, string $graphId): string {
-    $lines   = ["[GRAPH-ID:$graphId]"];
-    $org     = $event['organizer']['emailAddress'] ?? null;
+function buildCrmDescription(array $event): string {
+    $lines = ["Synced from O365"];
+
+    $org = $event['organizer']['emailAddress'] ?? null;
     if ($org) {
         $lines[] = "Organizer: " . ($org['name'] ?? '') . " <" . ($org['address'] ?? '') . ">";
     }
+
     $joinUrl = $event['onlineMeeting']['joinUrl'] ?? null;
     if (!$joinUrl && !empty($event['isOnlineMeeting'])) {
         if (preg_match('#https://teams\.microsoft\.com/[^\s"<>]+#', $event['body']['content'] ?? '', $m)) {
@@ -483,17 +562,24 @@ function buildCrmDescription(array $event, string $graphId): string {
     if ($joinUrl) $lines[] = "Teams join URL: $joinUrl";
 
     $bodyText = trim(html_entity_decode(strip_tags($event['body']['content'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    $bodyText = preg_replace("/(\r?\n){3,}/", "\n\n", $bodyText);
+    $bodyText = preg_replace("/(
+?
+){3,}/", "
+
+", $bodyText);
     if ($bodyText !== '') { $lines[] = ''; $lines[] = $bodyText; }
 
-    return implode("\n", $lines);
+    return implode("
+", $lines);
 }
 
-/** Strip sync metadata so only the user-facing description is sent to Graph */
+/** Strip sync metadata so only the user-facing body text is sent to Graph */
 function stripSyncMarker(string $description): string {
-    $description = preg_replace('/^\[GRAPH-ID:[^\]]+\]\n?/m', '', $description);
-    $description = preg_replace('/^Organizer:.*\n?/m', '', $description);
-    $description = preg_replace('/^Teams join URL:.*\n?/m', '', $description);
+    $description = preg_replace('/^Synced from O365\n?/m',       '', $description);
+    $description = preg_replace('/^Synced from SuiteCRM\n?/m',   '', $description);
+    $description = preg_replace('/^\[GRAPH-ID:[^\]]+\]\n?/m', '', $description); // legacy
+    $description = preg_replace('/^Organizer:.*\n?/m',           '', $description);
+    $description = preg_replace('/^Teams join URL:.*\n?/m',       '', $description);
     return trim($description);
 }
 
@@ -572,42 +658,55 @@ function applyGraphEventToCrm(array $event, string $mailboxEmail): array {
 
     $isCancelled = !empty($event['isCancelled']);
 
-    // ── No state yet: new event from Graph ──
+    // ── No state for this mailbox yet ──
     if (!$state) {
         if ($isCancelled) return ['skip' => true, 'reason' => 'Already cancelled, not in CRM'];
 
-        // Check legacy description marker
-        $s = $pdo->prepare("SELECT id, date_modified FROM meetings WHERE description LIKE ? LIMIT 1");
-        $s->execute(["[GRAPH-ID:$graphId]%"]);
-        $legacy = $s->fetch(PDO::FETCH_ASSOC);
+        // Build the CRM description now so we can compute the content hash
+        // BEFORE deciding whether to insert — same hash formula as dedup_meetings.php
+        $crmDescription = buildCrmDescription($event);
+        $meetingForHash = [
+            'name'        => $name,
+            'date_start'  => $dateStart,
+            'date_end'    => $dateEnd,
+            'description' => $crmDescription,
+        ];
+        $contentHash = computeContentHash($meetingForHash);
 
-        if ($legacy) {
-            $meetingId   = $legacy['id'];
-            $crmModified = $legacy['date_modified'];
-        } else {
-            $meetingId = generateUuid();
-            $pdo->prepare("
-                INSERT INTO meetings
-                    (id, name, date_start, date_end,
-                     duration_hours, duration_minutes,
-                     assigned_user_id, status, location, description,
-                     date_entered, date_modified, created_by, modified_user_id, deleted)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'Planned', ?, ?, NOW(), NOW(), ?, ?, 0)
-            ")->execute([
-                $meetingId, $name, $dateStart, $dateEnd,
-                $durationHours, $durationMinutes,
-                $organizerUserId, $location,
-                buildCrmDescription($event, $graphId),
-                $organizerUserId, $organizerUserId,
-            ]);
-            $crmModified = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        // 1. Content-hash check: O365 gives every attendee calendar a DIFFERENT
+        //    graph_event_id for the same real-world meeting. We look up by
+        //    content hash instead so we detect duplicates regardless of graph_event_id.
+        $stateByHash = getSyncStateByContentHash($contentHash);
+        if ($stateByHash) {
+            // Meeting already exists in CRM — just link this user as an attendee
+            ensureMeetingUser($stateByHash['meeting_id'], $userId);
+            return ['skip' => true, 'reason' => 'Duplicate detected via content hash, attendee linked'];
         }
+
+        // 2. Truly new — insert CRM meeting
+        $meetingId = generateUuid();
+        $pdo->prepare("
+            INSERT INTO meetings
+                (id, name, date_start, date_end,
+                 duration_hours, duration_minutes,
+                 assigned_user_id, status, location, description,
+                 date_entered, date_modified, created_by, modified_user_id, deleted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Planned', ?, ?, NOW(), NOW(), ?, ?, 0)
+        ")->execute([
+            $meetingId, $name, $dateStart, $dateEnd,
+            $durationHours, $durationMinutes,
+            $organizerUserId, $location,
+            $crmDescription,
+            $organizerUserId, $organizerUserId,
+        ]);
+        $crmModified = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
         ensureMeetingUser($meetingId, $userId);
         if ($organizerUserId !== $userId) ensureMeetingUser($meetingId, $organizerUserId);
         linkGraphAttendees($meetingId, $rawAttendees, $userId);
 
-        upsertSyncState($meetingId, $graphId, $mailboxEmail, $hashGraph, $crmModified, $graphModified);
+        // State row owned by first mailbox that processes this Graph event
+        upsertSyncState($meetingId, $graphId, $mailboxEmail, $hashGraph, $crmModified, $graphModified, $contentHash);
         return ['inserted' => true];
     }
 
@@ -660,11 +759,17 @@ function applyGraphEventToCrm(array $event, string $mailboxEmail): array {
         ")->execute([
             $name, $dateStart, $dateEnd,
             $durationHours, $durationMinutes,
-            $location, buildCrmDescription($event, $graphId),
+            $location, buildCrmDescription($event),
             $organizerUserId, $meetingId,
         ]);
         linkGraphAttendees($meetingId, $rawAttendees, $userId);
-        upsertSyncState($meetingId, $graphId, $mailboxEmail, $hashGraph, $graphModified, $graphModified);
+        // Recompute content hash from the freshly written description
+        $updatedDesc    = buildCrmDescription($event);
+        $updatedForHash = ['name' => $name, 'date_start' => $dateStart, 'date_end' => $dateEnd, 'description' => $updatedDesc];
+        $contentHashUpd = computeContentHash($updatedForHash);
+        // Store graphModified as last_modified_crm so outbound pass doesn't
+        // mistake this inbound write for a user-originated CRM change.
+        upsertSyncState($meetingId, $graphId, $mailboxEmail, $hashGraph, $graphModified, $graphModified, $contentHashUpd);
         return ['updated' => true, 'direction' => 'graph→crm'];
     }
 
@@ -679,6 +784,10 @@ function applyGraphEventToCrm(array $event, string $mailboxEmail): array {
 
     if ($crmTs >= $graphTs) {
         echo "      [CONFLICT] $name — CRM wins (newer)\n";
+        // Update state so last_modified_crm > last_modified_graph,
+        // which signals pushChangedCrmMeetings to push CRM version to Graph.
+        $conflictHashCrm = computeContentHash($crmMeeting);
+        upsertSyncState($meetingId, $graphId, $mailboxEmail, $hashCrm, $crmModified, $graphModified, $conflictHashCrm);
         return ['skip' => true, 'reason' => 'Conflict: CRM wins, outbound will patch Graph'];
     }
 
@@ -693,11 +802,15 @@ function applyGraphEventToCrm(array $event, string $mailboxEmail): array {
     ")->execute([
         $name, $dateStart, $dateEnd,
         $durationHours, $durationMinutes,
-        $location, buildCrmDescription($event, $graphId),
+        $location, buildCrmDescription($event),
         $organizerUserId, $meetingId,
     ]);
     linkGraphAttendees($meetingId, $rawAttendees, $userId);
-    upsertSyncState($meetingId, $graphId, $mailboxEmail, $hashGraph, $graphModified, $graphModified);
+    $conflictDescGraph  = buildCrmDescription($event);
+    $conflictForHash    = ['name' => $name, 'date_start' => $dateStart, 'date_end' => $dateEnd, 'description' => $conflictDescGraph];
+    $conflictHashGraph  = computeContentHash($conflictForHash);
+    // Store graphModified as last_modified_crm to prevent outbound echo.
+    upsertSyncState($meetingId, $graphId, $mailboxEmail, $hashGraph, $graphModified, $graphModified, $conflictHashGraph);
     return ['updated' => true, 'direction' => 'graph→crm (conflict)'];
 }
 
@@ -717,7 +830,6 @@ function pushNewCrmMeetings(string $token): array {
           AND m.date_end  >= ?
           AND m.date_start <= ?
           AND gss.id IS NULL
-          AND (m.description IS NULL OR m.description NOT LIKE '[GRAPH-ID:%')
         ORDER BY m.date_start ASC
     ");
     $stmt->execute([$outStart, $outEnd]);
@@ -738,15 +850,18 @@ function pushNewCrmMeetings(string $token): array {
 
         if (!$graphId) { $err++; continue; }
 
-        // Write Graph ID back into CRM description
+        // Write sync marker back into CRM description
         $cleanDesc = stripSyncMarker($meeting['description'] ?? '');
-        $newDesc   = trim("[GRAPH-ID:$graphId]\n" . $cleanDesc);
+        $newDesc   = trim("Synced from SuiteCRM\n" . $cleanDesc);
         db()->prepare("UPDATE meetings SET description=?, date_modified=NOW() WHERE id=?")
             ->execute([$newDesc, $meeting['id']]);
 
-        $hash   = computeHash($meeting['name'], $meeting['date_start'], $meeting['date_end'], $meeting['location'] ?? '', $attendeeEmails);
-        $nowUtc = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
-        upsertSyncState($meeting['id'], $graphId, $mailbox, $hash, $nowUtc, $nowUtc);
+        $hash        = computeHash($meeting['name'], $meeting['date_start'], $meeting['date_end'], $meeting['location'] ?? '', $attendeeEmails);
+        $nowUtc      = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        // Reload description after writeback for accurate content hash
+        $meeting['description'] = $newDesc;
+        $cHashNew = computeContentHash($meeting);
+        upsertSyncState($meeting['id'], $graphId, $mailbox, $hash, $nowUtc, $nowUtc, $cHashNew);
 
         echo "      [OUT+] " . $meeting['name'] . " → $mailbox\n";
         $ins++;
@@ -758,6 +873,16 @@ function pushNewCrmMeetings(string $token): array {
 // ============================================================
 // OUTBOUND: patch changed CRM meetings in Graph
 // ============================================================
+function fetchGraphEventModifiedTime(string $token, string $mailbox, string $graphId): ?string {
+    $url  = "https://graph.microsoft.com/v1.0/users/" . urlencode($mailbox)
+          . "/events/" . urlencode($graphId) . "?\$select=lastModifiedDateTime";
+    $resp = graphRequest($token, 'GET', $url);
+    if (isset($resp['lastModifiedDateTime'])) {
+        return (new DateTime($resp['lastModifiedDateTime'], new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+    }
+    return null;
+}
+
 function pushChangedCrmMeetings(string $token): array {
     $stmt = db()->query("
         SELECT m.*, gss.graph_event_id, gss.graph_mailbox,
@@ -780,18 +905,33 @@ function pushChangedCrmMeetings(string $token): array {
 
         if ($hashCrm === $row['last_sync_hash']) { $skip++; continue; }
 
-        // Only push if CRM is newer than last known Graph modification
+        // Push if:
+        //   a) CRM modified time >= Graph modified time (user edited CRM), OR
+        //   b) last_modified_crm == last_modified_graph (inbound set them equal as
+        //      a flag that CRM won a conflict and Graph still needs to be updated)
         $crmTs   = strtotime($row['date_modified']);
         $graphTs = strtotime($row['last_modified_graph']);
-        if ($crmTs < $graphTs) { $skip++; continue; }
+        $crmFlagTs  = strtotime($row['last_modified_crm']);
+
+        $conflictCrmWins = ($crmFlagTs > $graphTs); // CRM was newer at conflict time
+        $userEditedCrm   = ($crmTs >= $graphTs);
+
+        if (!$userEditedCrm && !$conflictCrmWins) { $skip++; continue; }
 
         $payload = buildGraphPayload($row, $attendeeEmails);
         $ok      = updateGraphEvent($token, $row['graph_mailbox'], $row['graph_event_id'], $payload);
 
         if (!$ok) { $err++; continue; }
 
-        $nowUtc = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
-        upsertSyncState($row['id'], $row['graph_event_id'], $row['graph_mailbox'], $hashCrm, $nowUtc, $nowUtc);
+        // Fetch the real lastModifiedDateTime Graph assigned after our PATCH,
+        // so next inbound run doesn't see it as a new Graph-side change.
+        $realGraphMod = fetchGraphEventModifiedTime($token, $row['graph_mailbox'], $row['graph_event_id']);
+        $nowUtc       = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        $graphModSave = $realGraphMod ?? $nowUtc;
+
+        $cHashChg = computeContentHash($row);
+        upsertSyncState($row['id'], $row['graph_event_id'], $row['graph_mailbox'],
+                        $hashCrm, $graphModSave, $graphModSave, $cHashChg);
 
         echo "      [OUT~] " . $row['name'] . "\n";
         $upd++;
@@ -831,18 +971,23 @@ function pushCrmDeletions(string $token): array {
 // ============================================================
 // DELETION DETECTION: events gone from Graph → soft-cancel CRM
 // ============================================================
-function detectGraphDeletions(array $seenGraphIds): void {
+function detectGraphDeletions(array $seenGraphIds, string $windowStart, string $windowEnd): void {
     foreach ($seenGraphIds as $mailbox => $ids) {
         if (empty($ids)) continue;
 
         $placeholders = implode(',', array_fill(0, count($ids), '?'));
-        $params       = array_merge([$mailbox], $ids);
+        // Only check meetings whose start falls inside the fetched calendarView window.
+        // Meetings outside the window were never fetched, so absence from $seenGraphIds
+        // does NOT mean they were deleted — it just means they're out of window.
+        $params = array_merge([$mailbox, $windowStart, $windowEnd], $ids);
 
         $stmt = db()->prepare("
             SELECT gss.meeting_id, gss.graph_event_id, m.name
             FROM graph_sync_state gss
             JOIN meetings m ON m.id = gss.meeting_id
             WHERE gss.graph_mailbox = ?
+              AND m.date_start >= ?
+              AND m.date_start <= ?
               AND gss.graph_event_id NOT IN ($placeholders)
               AND m.deleted = 0
               AND m.status != 'Not Held'
@@ -918,7 +1063,7 @@ foreach ($mailboxes as $email) {
 
 // ── DELETION DETECTION (Graph → CRM) ─────────────────────────
 echo "── DELETION DETECTION (Graph → CRM) ────────────────────\n";
-detectGraphDeletions($seenGraphIds);
+detectGraphDeletions($seenGraphIds, $inboundStart, $inboundEnd);
 echo "\n";
 
 // ── DELETIONS (CRM → Graph) ───────────────────────────────────

@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS graph_sync_state (
     last_modified_crm   DATETIME      NOT NULL,
     last_modified_graph DATETIME      NOT NULL,
     last_synced_at      DATETIME      NOT NULL,
+    content_hash        VARCHAR(64)   NULL DEFAULT NULL,
     UNIQUE KEY uq_meeting (meeting_id),
     UNIQUE KEY uq_graph   (graph_event_id(255), graph_mailbox)
 );

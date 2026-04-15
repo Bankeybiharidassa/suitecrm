@@ -193,6 +193,29 @@ This project was built as a **practical, transparent alternative** to commercial
 
 ---
 
+## Update 15-04-2026
+sync.php
+
+Full bidirectional sync (Graph ↔ SuiteCRM)
+Duplicate prevention via content hash (name + times + organizer + body)
+Conflict resolution: most recently modified wins
+External attendees created as Contacts
+Recurring meetings supported via calendarView expansion
+Clean Synced from O365 / Synced from SuiteCRM description markers
+Deletion handling both directions
+
+dedup.php
+
+Interactive cleanup tool for duplicate meetings
+Content hash based detection — works across different Graph event IDs
+Safe: never contacts Graph API, all writes in single transaction
+Moves state rows to keeper so sync never loses track of O365 events
+
+migrate_markers.php
+
+One-time migration replacing [GRAPH-ID:xxx] with Synced from O365
+Idempotent, safe to re-run
+
 ## License
 
 Free to use, modify, and distribute.
