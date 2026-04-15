@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS graph_sync_state (
+    id                  VARCHAR(36)   PRIMARY KEY,
+    meeting_id          VARCHAR(36)   NOT NULL,
+    graph_event_id      VARCHAR(500)  NOT NULL,
+    graph_mailbox       VARCHAR(255)  NOT NULL,
+    last_sync_hash      VARCHAR(64)   NOT NULL,
+    last_modified_crm   DATETIME      NOT NULL,
+    last_modified_graph DATETIME      NOT NULL,
+    last_synced_at      DATETIME      NOT NULL,
+    UNIQUE KEY uq_meeting (meeting_id),
+    UNIQUE KEY uq_graph   (graph_event_id(255), graph_mailbox)
+);
